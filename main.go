@@ -1,17 +1,20 @@
 package main
 
 import (
+	"bufio"
 	"flag"
 	"fmt"
-	"os"
-	"sync"
-
-	"bufio"
 	"io"
+	"io/ioutil"
+	"net/http"
+	"os"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/astaxie/beego/logs"
 	"github.com/erikdubbelboer/gspt"
+	"golang.org/x/net/proxy"
 )
 
 const programName = "socks5-checker"
@@ -115,7 +118,7 @@ func main() {
 	doCheck(&workArgs, &ctx)
 }
 
-func Strim(str string) string {
+func trim(str string) string {
 	str = strings.Replace(str, "\t", "", -1)
 	str = strings.Replace(str, " ", "", -1)
 	str = strings.Replace(str, "\n", "", -1)
@@ -129,7 +132,7 @@ func doCheck(env *WorkArgsT, ctx *Context) {
 
 	var wg sync.WaitGroup
 	// 可视情况加工作 goroutine 数
-	for i := 0; i < 4; i++ {
+	for i := 0; i < 128; i++ {
 		wg.Add(1)
 		go consumeQueue(&wg, i, env, ctx)
 	}
@@ -148,7 +151,7 @@ func produceQueue(env *WorkArgsT) {
 			break
 		}
 
-		line = Strim(line)
+		line = trim(line)
 		logs.Notice("[produceQueue] item: %s", line)
 		env.Queue <- line
 	}
@@ -172,6 +175,70 @@ func consumeQueue(wg *sync.WaitGroup, workerID int, env *WorkArgsT, ctx *Context
 		if proxyConf == "" {
 			continue
 		}
+
 		logs.Debug("[consumeQueue] workID: %d, proxyConf: %s", workerID, proxyConf)
+
+		targetURL := "https://www.google.com"
+		reqHeaders := map[string]string{
+			"Connection": "keep-alive",
+			"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_14_2) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/72.0.3626.121 Safari/537.36",
+			"Accept":     "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8",
+		}
+		_, httpStatusCode, errHttp := socks5Client(proxyConf, "GET", targetURL, reqHeaders, "")
+		if errHttp != nil || httpStatusCode == 0 {
+			logs.Error("[check-result] proxy: %s is invalid, status-code: %d, err: %v",
+				proxyConf, httpStatusCode, errHttp)
+		} else {
+			ctx.RwLock.Lock()
+			ctx.OutputFd.WriteString(proxyConf + "\n")
+			ctx.RwLock.Unlock()
+		}
+		logs.Notice("[check-result] proxy: %s , status-code: %d, err: %v",
+			proxyConf, httpStatusCode, errHttp)
 	}
+}
+
+func socks5Client(proxyConf, reqMethod string, reqUrl string, reqHeaders map[string]string, reqBody string) ([]byte, int, error) {
+	var httpStatusCode int
+	var emptyBody []byte
+
+	req, err := http.NewRequest(reqMethod, reqUrl, strings.NewReader(reqBody))
+	if err != nil {
+		logs.Error("[socks5Client] http.NewRequest fail, reqUrl:", reqUrl)
+		return emptyBody, httpStatusCode, err
+	}
+
+	for k, v := range reqHeaders {
+		req.Header.Set(k, v)
+	}
+
+	// Create a socks5 dialer
+	dialer, err := proxy.SOCKS5("tcp", proxyConf, nil, proxy.Direct)
+	if err != nil {
+		logs.Error("[socks5Client] proxy dialer err: %v, proxyConf: %s", err, proxyConf)
+	}
+
+	// Setup HTTP transport
+	tr := &http.Transport{
+		Dial: dialer.Dial,
+	}
+	client := &http.Client{
+		Transport: tr,
+		Timeout:   60 * time.Second,
+	}
+
+	resp, err := client.Do(req)
+	if err != nil {
+		logs.Error("[socks5Client] do request fail, reqUrl:", reqUrl, ", err:", err)
+		return emptyBody, httpStatusCode, err
+	}
+	defer resp.Body.Close()
+
+	body, err := ioutil.ReadAll(resp.Body)
+	if err != nil {
+		logs.Error("[socks5Client] read request fail, reqUrl:", reqUrl, ", err:", err)
+		return emptyBody, httpStatusCode, err
+	}
+
+	return body, resp.StatusCode, err
 }
